@@ -16,6 +16,9 @@ out/
 *.egg-info/
 *.egg
 
+#==Electronics==
+electronics/bluepill_prototype/bluepill_prototype-backups/
+
 #==System==
 .DS_Store
 Thumbs.db
@@ -30,3 +33,5 @@ Thumbs.db
 #==Logs==
 *.log
 logs/
+
+
