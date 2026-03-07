@@ -44,8 +44,8 @@ void setup()
 	pinMode(ROTATE_LEFT_PIN, OUTPUT);
 	pinMode(DEBUG_LED_RED_PIN, OUTPUT);
 	pinMode(DEEBUG_LED_YELLOW_PIN, OUTPUT);
-	//pinMode(PB10, INPUT_PULLUP); // SCL
-	//pinMode(PB11, INPUT_PULLUP); // SDA
+	pinMode(PB6, INPUT_PULLUP); // SCL
+	pinMode(PB7, INPUT_PULLUP); // SDA
 
 	attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallISR, FALLING);
 	pinMode(POT_PIN, INPUT); // Set PA1 as Analog input
@@ -60,22 +60,115 @@ void setup()
 	lcd.backlight();
 }
 
+void setPot(uint8_t step)
+{
+	// 1. Safety Clamp: The chip only accepts 0-127
+	if (step > 127)
+	{
+		step = 127;
+	}
+
+	// 2. Start Communication
+	Wire.beginTransmission(MCP40D18_ADDRESS);
+
+	// 3. Send Command Byte (REQUIRED for MCP40D18)
+	// 0x00 tells the chip: "Write Data to Wiper Register"
+	Wire.write(0x00);
+
+	// 4. Send Data Byte (The Resistance Value)
+	Wire.write(step);
+
+	// 5. Stop Communication
+	Wire.endTransmission();
+}
+
 void loop()
 {
+	static uint32_t lastLcdUpdate = 0;
 
+	if (digitalRead(BUTTON_PIN) == HIGH)
+	{
+		digitalWrite(ROTATE_LEFT_PIN, HIGH);
+	}
+	else
+	{
+		digitalWrite(ROTATE_LEFT_PIN, LOW);
+	}
 
-	lcd.clear();
-	lcd.setCursor(0, 0);
-	lcd.print("RPM:");
-	lcd.setCursor(4, 0);
-	lcd.print("rpm");
-	lcd.setCursor(0, 1);
-	lcd.print("PWM:");
-	lcd.print("200");
-	delay(1000);
-	digitalWrite(DEBUG_LED_RED_PIN, HIGH);
-	digitalWrite(DEEBUG_LED_YELLOW_PIN, HIGH);
-	delay(1000);
-	digitalWrite(DEBUG_LED_RED_PIN, LOW);
-	digitalWrite(DEEBUG_LED_YELLOW_PIN, LOW);
+	if (led_state)
+	{
+		led_state = 0;
+		digitalWrite(DEBUG_LED_RED_PIN, LOW);
+	}
+	else
+	{
+		led_state = 1;
+		digitalWrite(DEBUG_LED_RED_PIN, HIGH);
+	}
+
+	// --- POTENTIOMETER TO PWM LOGIC ---
+	int potValue = analogRead(POT_PIN);
+	int pwmValue = map(potValue, 0, 1023, 0, 127);
+	setPot(pwmValue);
+
+	if (newData)
+	{
+		noInterrupts();
+		uint32_t p = period;
+		newData = false;
+		interrupts();
+
+		periodBuf[bufIndex++] = p;
+		if (bufIndex >= MAX_SAMPLES)
+			bufIndex = 0;
+	}
+
+	uint32_t now = millis();
+
+	if (now - lastLcdUpdate >= LCD_UPDATE_MS)
+	{
+		lastLcdUpdate = now;
+		uint32_t rpm = 0;
+
+		if (now - lastPulseMs < RPM_TIMEOUT_MS)
+		{
+			uint32_t lastPeriod = periodBuf[(bufIndex + MAX_SAMPLES - 1) % MAX_SAMPLES];
+			if (lastPeriod > 0)
+			{
+				uint32_t estimatedRPM = 60000000UL / lastPeriod;
+
+				if (estimatedRPM >= 100)
+				{
+					if (estimatedRPM > 5000)
+						sampleCount = 2;
+					else
+						sampleCount = 4;
+
+					uint64_t sum = 0;
+					for (uint8_t i = 0; i < sampleCount; i++)
+					{
+						uint8_t index = (bufIndex + MAX_SAMPLES - 1 - i) % MAX_SAMPLES;
+						sum += periodBuf[index];
+					}
+					uint32_t avgPeriod = sum / sampleCount;
+					rpm = 60000000UL / avgPeriod;
+				}
+				else
+				{
+					rpm = estimatedRPM;
+				}
+			}
+		}
+
+		lcd.init();
+		lcd.backlight();
+		lcd.clear();
+		lcd.setCursor(0, 0);
+		lcd.print("RPM:");
+		lcd.setCursor(4, 0);
+		lcd.print(rpm);
+		lcd.setCursor(0, 1);
+		lcd.print("PWM:");
+		lcd.print(pwmValue);
+	}
 }
