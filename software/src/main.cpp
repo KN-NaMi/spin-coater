@@ -1,260 +1,141 @@
-#include "lcd.h"
-#include "pid.h"
+#include <SimpleFOC.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include "pinout.h"
 
-#define HALL_PIN PA0 // Pin czujnika Halla
-#define BUTTON_PIN PB9
-#define DEBUG_LED_RED_PIN PB5
-#define DEEBUG_LED_YELLOW_PIN PB4
-#define ROTATE_LEFT_PIN PB8 // turn on/off motor
-#define POT_PIN PA4			// Potentiometer connected to PA1 (Analog)
-#define LCD_UPDATE_MS 500	// Odświeżanie LCD
-#define RPM_TIMEOUT_MS 200	// timeout na pokazanie 0 RPM
-#define RPM_UPDATE_MS 100   // co ile zmienic moc silnika
-#define MCP40D18_ADDRESS 0x2e
-#define HAL_INTERRUPT_DEBOUNCE_US 5000
+HardwareSerial Serial2(PA3, PA2);
 
-typedef uint32_t rpm_t;
+// --- MOTOR CONFIG (8 POLES = 4 PAIRS) ---
+#define POLE_PAIRS 4
+#define POWER_SUPPLY_VOLTAGE 12.0
+#define MOTOR_VOLTAGE_LIMIT 8.0 // Increased for more power
+#define MAX_TARGET_RPM 20000.0
 
-struct lcd lcd(0x27, 16, 4);
+BLDCMotor motor = BLDCMotor(POLE_PAIRS);
+BLDCDriver3PWM driver = BLDCDriver3PWM(DRIVER_IN1, DRIVER_IN2, DRIVER_IN3, DRIVER_EN);
+HallSensor sensor = HallSensor(HALL_U, HALL_V, HALL_W, POLE_PAIRS);
+LiquidCrystal_I2C lcd(0x27, 16, 4);
 
-volatile uint32_t last_revolution_detection = 0;
-volatile uint32_t revolution_period = 0;
-volatile bool revolution_completed = false;
-volatile uint32_t last_revolution_ms = 0;
-struct rpm_probe {
-	uint32_t rpm;
-	uint8_t probe;
-};
-const struct rpm_probe rpm_probe_nums[] = {
-/*    RPM      probes */
-	{ 0,       4 },
-	{ 500,     16 },
-	{ 2000,    24 },
-	{ 4000,    32 },
-	{ 6000,    48 },
-	{ 8000,    64 },
-};
+void doA() { sensor.handleA(); }
+void doB() { sensor.handleB(); }
+void doC() { sensor.handleC(); }
 
-bool led_state = 0;
-
-uint32_t period_buf[64];
-#define PERIOD_BUFF_SIZE (sizeof(period_buf)/sizeof(*period_buf))
-uint8_t buf_index = 0;
-
-struct pid_controller pid;
-
-void
-hall_isr()
+void setup()
 {
-	uint32_t now = micros();
-	uint32_t diff = now - last_revolution_detection;
-	last_revolution_detection = now;
+// Free PB3/PB4 for Hall Sensors
+#if defined(STM32F1xx) || defined(ARDUINO_ARCH_STM32F1)
+	RCC->APB2ENR |= RCC_APB2ENR_AFIOEN;
+	AFIO->MAPR = (AFIO->MAPR & ~AFIO_MAPR_SWJ_CFG_Msk) | AFIO_MAPR_SWJ_CFG_JTAGDISABLE;
+#endif
 
-	if (diff > HAL_INTERRUPT_DEBOUNCE_US)
-	{
-		revolution_period = diff;
-		revolution_completed = true;
-		last_revolution_ms = millis();
-	}
-}
+	Serial2.begin(115200);
+	delay(2000);
 
-void
-setup()
-{
-	Wire.begin();
+	SimpleFOCDebug::enable(&Serial2);
+	Serial2.println("\n--- CALIBRATION BOOST MODE ---");
 
-	pinMode(HALL_PIN, INPUT_PULLUP);
 	pinMode(BUTTON_PIN, INPUT_PULLDOWN);
-	pinMode(ROTATE_LEFT_PIN, OUTPUT);
-	pinMode(DEBUG_LED_RED_PIN, OUTPUT);
-	pinMode(DEEBUG_LED_YELLOW_PIN, OUTPUT);
-	pinMode(PB6, INPUT_PULLUP); // SCL
-	pinMode(PB7, INPUT_PULLUP); // SDA
+	pinMode(POT_PIN, INPUT);
+	pinMode(LED_YELLOW, OUTPUT);
+	pinMode(LED_RED, OUTPUT);
 
-	attachInterrupt(digitalPinToInterrupt(HALL_PIN), hall_isr, FALLING);
-	pinMode(POT_PIN, INPUT); // Set PA1 as Analog input
-	memset(period_buf, 0, sizeof(period_buf));
+	Wire.begin();
+	lcd.init();
+	lcd.backlight();
+	lcd.print("Calibrating...");
 
-	digitalWrite(DEBUG_LED_RED_PIN, LOW);
-	delay(1);
-	digitalWrite(DEBUG_LED_RED_PIN, HIGH);
-	delay(5);
-	digitalWrite(DEBUG_LED_RED_PIN, LOW);
+	sensor.pullup = Pullup::USE_INTERN;
+	sensor.init();
+	sensor.enableInterrupts(doA, doB, doC);
+	motor.linkSensor(&sensor);
 
-	init_lcd(&lcd, 16, 4);
+	driver.voltage_power_supply = POWER_SUPPLY_VOLTAGE;
+	driver.init();
+	motor.linkDriver(&driver);
 
-	pid = init_pid((double)RPM_UPDATE_MS / 1000, 0.002, 0.01, 0.0005);
-}
+	// --- MOTOR SETTINGS ---
+	motor.foc_modulation = FOCModulationType::SpaceVectorPWM; // Better torque
+	motor.controller = MotionControlType::velocity;
 
-void
-setPot(int step)
-{
-	// 1. Safety Clamp: The chip only accepts 0-127
-	if (step > 127)
+	// PID Tuning - lowered P for more stable startup
+	motor.PID_velocity.P = 0.1f;
+	motor.PID_velocity.I = 2.0f;
+
+	motor.voltage_limit = MOTOR_VOLTAGE_LIMIT;
+	motor.velocity_limit = MAX_TARGET_RPM * 0.10472f;
+
+	// --- ⚠️ CALIBRATION BOOST ⚠️ ---
+	// If the motor still doesn't move 90 degrees, increase 8.0 to 10.0
+	motor.voltage_sensor_align = 8.0;
+	// Move slower and longer during calibration to ensure hall states change
+	motor.velocity_index_search = 1.0;
+
+	motor.init();
+	motor.useMonitoring(Serial2);
+
+	Serial2.println("Starting calibration now. WATCH THE MOTOR.");
+	Serial2.println("It should move significantly (at least 1/4 turn).");
+
+	int initResult = motor.initFOC();
+
+	if (initResult == 0)
 	{
-		step = 127;
+		Serial2.println("❌ FOC FAILED. Motor didn't move enough.");
+		lcd.clear();
+		lcd.print("FAILED TO MOVE");
+		while (1)
+			;
 	}
-	if(step < 0) {
-		step = 0;
-	}
-	step = 127 - step;
-
-	// 2. Start Communication
-	Wire.beginTransmission(MCP40D18_ADDRESS);
-
-	// 3. Send Command Byte (REQUIRED for MCP40D18)
-	// 0x00 tells the chip: "Write Data to Wiper Register"
-	Wire.write(0x00);
-
-	// 4. Send Data Byte (The Resistance Value)
-	Wire.write((uint8_t)step);
-
-	// 5. Stop Communication
-	Wire.endTransmission();
-}
-
-uint32_t
-to_2_sig_digits(uint32_t num)
-{
-	if(num < 100)     return num;
-	if(num < 1000)    return num - num%10;
-	if(num < 10000)   return num - num%100;
-	if(num < 100000)  return num - num%1000;
-	if(num < 1000000) return num - num%10000;
-}
-
-uint32_t
-get_rpm()
-{
-	static uint32_t prev_rpm = 0;
-	uint32_t rpm = 0;
-	uint32_t now = millis();
-	uint8_t i;
-	uint8_t num_probes;
-	uint64_t probes_sum;
-	uint8_t probe_index;
-	uint32_t avg_period;
-
-	if (now - last_revolution_ms < RPM_TIMEOUT_MS)
+	else
 	{
-		probes_sum = 0;
-
-		for(i = 0; i < sizeof(rpm_probe_nums)/sizeof(struct rpm_probe); ++i) {
-			if(prev_rpm >= rpm_probe_nums[i].rpm) {
-				num_probes = rpm_probe_nums[i].probe;
-			} else {
-				break;
-			}
-		}
-
-		for (i = 0; i < num_probes; i++)
-		{
-			probe_index = (buf_index + PERIOD_BUFF_SIZE - 1 - i) % PERIOD_BUFF_SIZE;
-			probes_sum += period_buf[probe_index];
-		}
-		avg_period = probes_sum / num_probes;
-		if(avg_period == 0) {
-			rpm = 0;
-		} else {
-			rpm = 60000000UL / avg_period;
-		}
-		prev_rpm = rpm;
+		Serial2.println("✅ FOC SUCCESS!");
+		lcd.clear();
+		lcd.print("FOC SUCCESS!");
 	}
-
-	return rpm;
-}
-
-void
-update_lcd(rpm_t target_rpm, unsigned int pot_value, rpm_t current_rpm, int power)
-{
-	static uint32_t lastLcdUpdate = 0;
-	uint32_t now;
-
-	now = millis();
-
-	if (now - lastLcdUpdate >= LCD_UPDATE_MS)
-	{
-		lastLcdUpdate = now;
-
-		set_cur_lcd(&lcd, 0, 0);
-		printf_lcd(&lcd, "RPM: %d", (int)to_2_sig_digits(current_rpm));
-		wipe_line(&lcd);
-		set_cur_lcd(&lcd, 0, 1);
-		printf_lcd(&lcd, "TGT: %d (%d)", (int)to_2_sig_digits(target_rpm), (int)pot_value);
-		wipe_line(&lcd);
-		set_cur_lcd(&lcd, 0, 2);
-		printf_lcd(&lcd, "POW: %d", (int)power);
-		wipe_line(&lcd);
-		set_cur_lcd(&lcd, 0, 3);
-		printf_lcd(&lcd, "ERR: %d", (int)to_2_sig_digits(abs((int32_t)target_rpm-(int32_t)current_rpm)));
-		wipe_line(&lcd);
-		flush_lcd(&lcd);
-	}
-}
-
-double
-update_motor_power(rpm_t current_rpm, rpm_t target_rpm)
-{
-	static double power = 0;
-	static uint32_t last_motor_update = 0;
-	uint32_t now;
-
-	now = millis();
-
-	if(now - last_motor_update >= RPM_UPDATE_MS) {
-		last_motor_update = now;
-
-		power = run_pid(&pid, current_rpm, target_rpm);
-		setPot(power);
-	}
-
-	return power;
 }
 
 void loop()
 {
-	static int prev_state = 0;
-	unsigned int pot_value;
-	rpm_t target_rpm;
-	rpm_t current_rpm;
-	double power;
-	uint32_t read_period;
+	motor.loopFOC();
 
-	// --- POTENTIOMETER TO PWM LOGIC ---
-	pot_value = analogRead(POT_PIN);
-	target_rpm = map(pot_value, 100, 1023, 1100, 8000);
+	static uint32_t lastDisplayUpdate = 0;
 
-	if (digitalRead(BUTTON_PIN) == HIGH) {
-		digitalWrite(ROTATE_LEFT_PIN, HIGH);
-	} else {
-		digitalWrite(ROTATE_LEFT_PIN, LOW);
-		target_rpm = 0;
-		reset_pid(&pid);
-	}
+	int potValue = analogRead(POT_PIN);
+	float target_rpm = map(potValue, 0, 1023, 0, MAX_TARGET_RPM);
+	float target_rads = target_rpm * 0.1047198f;
 
-	if (led_state) {
-		digitalWrite(DEBUG_LED_RED_PIN, LOW);
-	} else {
-		digitalWrite(DEBUG_LED_RED_PIN, HIGH);
-	}
-	led_state = !led_state;
-
-	if (revolution_completed)
+	if (digitalRead(BUTTON_PIN))
 	{
-		noInterrupts();
-		read_period = revolution_period;
-		revolution_completed = false;
-		interrupts();
-
-		period_buf[buf_index++] = read_period;
-		if (buf_index >= PERIOD_BUFF_SIZE)
-			buf_index = 0;
+		digitalWrite(LED_RED, HIGH);
+		motor.enable();
+		motor.move(target_rads);
+	}
+	else
+	{
+		digitalWrite(LED_RED, LOW);
+		target_rpm = 0;
+		motor.move(0);
+		motor.disable();
 	}
 
-	current_rpm = get_rpm();
+	if (millis() - lastDisplayUpdate >= 250)
+	{
+		lastDisplayUpdate = millis();
+		digitalWrite(LED_YELLOW, !digitalRead(LED_YELLOW));
+		float current_rpm = motor.shaft_velocity * 9.549297f;
+		float power_voltage = motor.voltage.q;
 
-	power = update_motor_power(current_rpm, target_rpm);
-
-	update_lcd(target_rpm, pot_value, current_rpm, power);
+		char buf[20];
+		lcd.setCursor(0, 0);
+		snprintf(buf, sizeof(buf), "Cur: %5d RPM ", (int)current_rpm);
+		lcd.print(buf);
+		lcd.setCursor(0, 1);
+		snprintf(buf, sizeof(buf), "Tgt: %5d RPM ", (int)target_rpm);
+		lcd.print(buf);
+		lcd.setCursor(0, 3);
+		int volts = (int)abs(power_voltage);
+		int fractional = (int)(abs(power_voltage) * 100) % 100;
+		snprintf(buf, sizeof(buf), "Pow: %s%d.%02d V   ", (power_voltage < 0 ? "-" : ""), volts, fractional);
+		lcd.print(buf);
+	}
 }
-
