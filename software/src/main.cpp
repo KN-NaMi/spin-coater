@@ -1,141 +1,127 @@
-#include <SimpleFOC.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
+#include <Arduino.h>
 #include "pinout.h"
 
-HardwareSerial Serial2(PA3, PA2);
+// Setup Serial2 on RX=PA3, TX=PA2
+HardwareSerial debugSerial(PA3, PA2);
 
-// --- MOTOR CONFIG (8 POLES = 4 PAIRS) ---
-#define POLE_PAIRS 4
-#define POWER_SUPPLY_VOLTAGE 12.0
-#define MOTOR_VOLTAGE_LIMIT 8.0 // Increased for more power
-#define MAX_TARGET_RPM 20000.0
+// Global pointer to our manually managed Timer 1
+HardwareTimer *HT = NULL;
 
-BLDCMotor motor = BLDCMotor(POLE_PAIRS);
-BLDCDriver3PWM driver = BLDCDriver3PWM(DRIVER_IN1, DRIVER_IN2, DRIVER_IN3, DRIVER_EN);
-HallSensor sensor = HallSensor(HALL_U, HALL_V, HALL_W, POLE_PAIRS);
-LiquidCrystal_I2C lcd(0x27, 16, 4);
+float test_angle = 0;
+float set_voltage = 3.0f;  // Safe starting voltage (adjust up to 5V if motor is stiff)
+float max_voltage = 12.0f; // Your power supply voltage
 
-void doA() { sensor.handleA(); }
-void doB() { sensor.handleB(); }
-void doC() { sensor.handleC(); }
+// Non-blocking timer variables for logging
+unsigned long lastLogTime = 0;
+const unsigned long logInterval = 500;
+
+// LED Blinky timer
+unsigned long lastBlinkTime = 0;
+bool ledState = false;
 
 void setup()
 {
-// Free PB3/PB4 for Hall Sensors
-#if defined(STM32F1xx) || defined(ARDUINO_ARCH_STM32F1)
-	RCC->APB2ENR |= RCC_APB2ENR_AFIOEN;
-	AFIO->MAPR = (AFIO->MAPR & ~AFIO_MAPR_SWJ_CFG_Msk) | AFIO_MAPR_SWJ_CFG_JTAGDISABLE;
-#endif
+  debugSerial.begin(115200);
 
-	Serial2.begin(115200);
-	delay(2000);
+  debugSerial.println("\n==================================================");
+  debugSerial.println("       Remapped 6-PWM Hardware Controller         ");
+  debugSerial.println("==================================================");
 
-	SimpleFOCDebug::enable(&Serial2);
-	Serial2.println("\n--- CALIBRATION BOOST MODE ---");
+  // Setup Yellow LED pin as a visual heartbeat
+  pinMode(LED_YELLOW, OUTPUT);
 
-	pinMode(BUTTON_PIN, INPUT_PULLDOWN);
-	pinMode(POT_PIN, INPUT);
-	pinMode(LED_YELLOW, OUTPUT);
-	pinMode(LED_RED, OUTPUT);
+  // 1. Instantiate Timer 1 Hardware first
+  debugSerial.println("[INFO] Allocating HardwareTimer(TIM1)...");
+  HT = new HardwareTimer(TIM1);
 
-	Wire.begin();
-	lcd.init();
-	lcd.backlight();
-	lcd.print("Calibrating...");
+  // 2. Configure 3-Phase complementary pins (High on PA8/9/10, Low on PA7/PB0/PB1)
+  // This initializes the GPIO modes first.
+  debugSerial.println("[INFO] Configuring TIM1 Pin Modes...");
+  HT->setMode(1, TIMER_OUTPUT_COMPARE_PWM1, PA8); // Phase A High
+  HT->setMode(1, TIMER_OUTPUT_COMPARE_PWM1, PA7); // Phase A Low (Remapped Complement)
 
-	sensor.pullup = Pullup::USE_INTERN;
-	sensor.init();
-	sensor.enableInterrupts(doA, doB, doC);
-	motor.linkSensor(&sensor);
+  HT->setMode(2, TIMER_OUTPUT_COMPARE_PWM1, PA9); // Phase B High
+  HT->setMode(2, TIMER_OUTPUT_COMPARE_PWM1, PB0); // Phase B Low (Remapped Complement)
 
-	driver.voltage_power_supply = POWER_SUPPLY_VOLTAGE;
-	driver.init();
-	motor.linkDriver(&driver);
+  HT->setMode(3, TIMER_OUTPUT_COMPARE_PWM1, PA10); // Phase C High
+  HT->setMode(3, TIMER_OUTPUT_COMPARE_PWM1, PB1);  // Phase C Low (Remapped Complement)
 
-	// --- MOTOR SETTINGS ---
-	motor.foc_modulation = FOCModulationType::SpaceVectorPWM; // Better torque
-	motor.controller = MotionControlType::velocity;
+  // 3. Set Frequency to 25kHz
+  HT->setOverflow(25000, HERTZ_FORMAT);
 
-	// PID Tuning - lowered P for more stable startup
-	motor.PID_velocity.P = 0.1f;
-	motor.PID_velocity.I = 2.0f;
+  // 4. Inject hardware Dead-Time (~1.6 microseconds) to protect MOSFETs
+  debugSerial.println("[INFO] Injecting hardware Dead-Time (~1.6 microseconds)...");
+  TIM1->BDTR &= ~TIM_BDTR_DTG;
+  TIM1->BDTR |= 120;
 
-	motor.voltage_limit = MOTOR_VOLTAGE_LIMIT;
-	motor.velocity_limit = MAX_TARGET_RPM * 0.10472f;
+  // 5. CRITICAL FIX: Enable AFIO and Apply Timer 1 Partial Remap AFTER configuring pins!
+  // This ensures the library doesn't overwrite our hardware remap.
+  debugSerial.println("[INFO] Routing TIM1 outputs to PA7/PB0/PB1...");
+  __HAL_RCC_AFIO_CLK_ENABLE();
+  __HAL_AFIO_REMAP_TIM1_PARTIAL();
 
-	// --- ⚠️ CALIBRATION BOOST ⚠️ ---
-	// If the motor still doesn't move 90 degrees, increase 8.0 to 10.0
-	motor.voltage_sensor_align = 8.0;
-	// Move slower and longer during calibration to ensure hall states change
-	motor.velocity_index_search = 1.0;
+  // 6. Start the Timer Clock
+  debugSerial.println("[INFO] Starting TIM1 Hardware Clock...");
+  HT->resume();
 
-	motor.init();
-	motor.useMonitoring(Serial2);
-
-	Serial2.println("Starting calibration now. WATCH THE MOTOR.");
-	Serial2.println("It should move significantly (at least 1/4 turn).");
-
-	int initResult = motor.initFOC();
-
-	if (initResult == 0)
-	{
-		Serial2.println("❌ FOC FAILED. Motor didn't move enough.");
-		lcd.clear();
-		lcd.print("FAILED TO MOVE");
-		while (1)
-			;
-	}
-	else
-	{
-		Serial2.println("✅ FOC SUCCESS!");
-		lcd.clear();
-		lcd.print("FOC SUCCESS!");
-	}
+  debugSerial.println("[SUCCESS] Timer 1 is running in Remapped 6-PWM Mode!");
+  debugSerial.println("==================================================\n");
 }
 
 void loop()
 {
-	motor.loopFOC();
+  // Rotate the electrical angle slowly (incrementing this number speeds it up)
+  test_angle = fmod(test_angle + 0.1, TWO_PI);
 
-	static uint32_t lastDisplayUpdate = 0;
+  // Generate 3-phase shifted sine waves (120-degrees / 2*PI/3 rad apart)
+  float pwmA = set_voltage * (sin(test_angle) + 1.0f) / 2.0f;
+  float pwmB = set_voltage * (sin(test_angle + 2.094395f) + 1.0f) / 2.0f;
+  float pwmC = set_voltage * (sin(test_angle + 4.188790f) + 1.0f) / 2.0f;
 
-	int potValue = analogRead(POT_PIN);
-	float target_rpm = map(potValue, 0, 1023, 0, MAX_TARGET_RPM);
-	float target_rads = target_rpm * 0.1047198f;
+  // Convert target voltages into exact Duty Cycle percentages (0 to 100%)
+  float dcA = (pwmA / max_voltage) * 100.0f;
+  float dcB = (pwmB / max_voltage) * 100.0f;
+  float dcC = (pwmC / max_voltage) * 100.0f;
 
-	if (digitalRead(BUTTON_PIN))
-	{
-		digitalWrite(LED_RED, HIGH);
-		motor.enable();
-		motor.move(target_rads);
-	}
-	else
-	{
-		digitalWrite(LED_RED, LOW);
-		target_rpm = 0;
-		motor.move(0);
-		motor.disable();
-	}
+  // Apply Duty Cycles directly to STM32 Timer 1 hardware registers
+  HT->setCaptureCompare(1, dcA, PERCENT_COMPARE_FORMAT);
+  HT->setCaptureCompare(2, dcB, PERCENT_COMPARE_FORMAT);
+  HT->setCaptureCompare(3, dcC, PERCENT_COMPARE_FORMAT);
 
-	if (millis() - lastDisplayUpdate >= 250)
-	{
-		lastDisplayUpdate = millis();
-		digitalWrite(LED_YELLOW, !digitalRead(LED_YELLOW));
-		float current_rpm = motor.shaft_velocity * 9.549297f;
-		float power_voltage = motor.voltage.q;
+  unsigned long currentMillis = millis();
 
-		char buf[20];
-		lcd.setCursor(0, 0);
-		snprintf(buf, sizeof(buf), "Cur: %5d RPM ", (int)current_rpm);
-		lcd.print(buf);
-		lcd.setCursor(0, 1);
-		snprintf(buf, sizeof(buf), "Tgt: %5d RPM ", (int)target_rpm);
-		lcd.print(buf);
-		lcd.setCursor(0, 3);
-		int volts = (int)abs(power_voltage);
-		int fractional = (int)(abs(power_voltage) * 100) % 100;
-		snprintf(buf, sizeof(buf), "Pow: %s%d.%02d V   ", (power_voltage < 0 ? "-" : ""), volts, fractional);
-		lcd.print(buf);
-	}
+  // Non-blocking Yellow LED Blink (Every 250ms)
+  // If this stops blinking, the code has frozen.
+  if (currentMillis - lastBlinkTime >= 250)
+  {
+    lastBlinkTime = currentMillis;
+    ledState = !ledState;
+    digitalWrite(LED_YELLOW, ledState ? HIGH : LOW);
+  }
+
+  // Throttled logging block (runs twice per second)
+  if (currentMillis - lastLogTime >= logInterval)
+  {
+    lastLogTime = currentMillis;
+
+    float angleDegrees = test_angle * (180.0f / PI);
+
+    // --- Serial Output ---
+    debugSerial.println("----------------------------------------");
+    debugSerial.print("Angle: ");
+    debugSerial.print(angleDegrees, 0);
+    debugSerial.println(" deg");
+    debugSerial.print("Duty Cycles: ");
+    debugSerial.print("U=");
+    debugSerial.print(dcA, 1);
+    debugSerial.print("% | ");
+    debugSerial.print("V=");
+    debugSerial.print(dcB, 1);
+    debugSerial.print("% | ");
+    debugSerial.print("W=");
+    debugSerial.print(dcC, 1);
+    debugSerial.println("%");
+  }
+
+  delay(20);
 }
