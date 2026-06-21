@@ -22,7 +22,7 @@
 
 // --- Status LEDs ---
 #define LED_YELLOW PB9
-#define LED_RED PB8
+#define LED_RED PB7
 
 // --- Debug UART ---
 #define UART_RX PA3
