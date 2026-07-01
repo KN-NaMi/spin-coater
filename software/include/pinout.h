@@ -1,29 +1,29 @@
 #pragma once
 
-// --- Motor Driver Pins ( TIM1 Default ) ---
-// --- Motor Driver Pins ( TIM1 Remapped ) ---
-#define DRIVER_IN1H PA8	 // 1 High PWM
-#define DRIVER_IN1L PA7	 // 1 Low  (Back to PA7)
-#define DRIVER_IN2H PA9	 // 2 High
-#define DRIVER_IN2L PB0	 // 2 Low  (Back to PB0)
-#define DRIVER_IN3H PA10 // 3 High
-#define DRIVER_IN3L PB1	 // 3 Low  (Back to PB1)
+// --- Motor Driver Pins ---
+
+#define DRIVER_UH PA8
+#define DRIVER_UL PB13
+#define DRIVER_VH PA9
+#define DRIVER_VL PB14
+#define DRIVER_WH PA10
+#define DRIVER_WL PB15
 
 // --- Hall Effect Sensor Pins ---
-#define HALL_U
-#define HALL_V
-#define HALL_W
+#define HALL_U PA15
+#define HALL_V PA11
+#define HALL_W PA12
 
 // --- User Interface & I2C ---
-#define BUTTON_PIN PA1
+#define BUTTON_PIN PC15
 #define POT_PIN PA0
-#define I2C_SCL PB6
-#define I2C_SDA PB7
+#define I2C_SCL
+#define I2C_SDA
 
 // --- Status LEDs ---
-#define LED_YELLOW PB9
-#define LED_RED PB7
+#define LED_YELLOW PC13
+#define LED_RED PC14
 
 // --- Debug UART ---
-#define UART_RX PA3
 #define UART_TX PA2
+#define UART_RX PA3

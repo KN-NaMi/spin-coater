@@ -1,129 +1,51 @@
-#include <Arduino.h>
-#include <pinout.h>
+#include <SimpleFOC.h>
+#include "pinout.h"
 
-const uint16_t DELAY = 10000;
+BLDCDriver6PWM driver = BLDCDriver6PWM(DRIVER_UH, DRIVER_UL, DRIVER_VH, DRIVER_VL, DRIVER_WH, DRIVER_WL);
+HardwareSerial Serial2(UART_RX, UART_TX);
 
-#define AL DRIVER_IN1L
-#define AH DRIVER_IN1H
-#define BL DRIVER_IN2L
-#define BH DRIVER_IN2H
-#define CL DRIVER_IN3L
-#define CH DRIVER_IN3H
+void setup() {
+  Serial2.begin(115200);
+  delay(2000);
 
-void allOff()
-{
-  // PORTD = 0x01010100;
-  digitalWrite(AL, HIGH);
-  digitalWrite(AH, LOW);
-  digitalWrite(BL, HIGH);
-  digitalWrite(BH, LOW);
-  digitalWrite(CL, HIGH);
-  digitalWrite(CH, LOW);
-  // delayMicroseconds(DELAY);
+  driver.voltage_power_supply = 12;
+  driver.pwm_frequency = 4000; // Lower frequency for testing, was higher breaking things
+  driver.dead_zone = 0.05;
+  driver.init();
+
+  // Invert logic for PMOS -> Driver specific
+  TIM1->CCER |= (TIM_CCER_CC1P | TIM_CCER_CC2P | TIM_CCER_CC3P);
+  TIM1->CCER &= ~(TIM_CCER_CC1NP | TIM_CCER_CC2NP | TIM_CCER_CC3NP);
+
+  driver.enable();
+  Serial2.println("Starting Manual 6-Step Commutation...");
 }
 
-void step1()
-{
-  allOff();
-  digitalWrite(AH, HIGH);
-  digitalWrite(BL, LOW);
+// Helper to add a manual safety gap
+void safetyGap() {
+  driver.setPwm(0, 0, 0);
+  delayMicroseconds(500); // Massive 0.5ms safety gap
 }
 
-void step2()
-{
-  allOff();
-  digitalWrite(AH, HIGH);
-  digitalWrite(CL, LOW);
-}
+void loop() {
+  float V = 6.0; // Test Voltage
+  int step_delay = 5; // Milliseconds per step. Decrease to go faster.
 
-void step3()
-{
-  allOff();
-  digitalWrite(BH, HIGH);
-  digitalWrite(CL, LOW);
-}
+  // State 1: U-High, V-Low
+  driver.setPwm(V, 0, -1); // SimpleFOC notation: -1 can mean float/ground depending on version
+  // For safety in 6-PWM, we'll use literal 0 for Low
+  driver.setPwm(V, 0, 0);
+  delay(step_delay);
+  safetyGap();
 
-void step4()
-{
-  allOff();
-  digitalWrite(BH, HIGH);
-  digitalWrite(AL, LOW);
-}
+  // State 2: U-High, W-Low
+  driver.setPwm(V, 0, 0); // (Wait, in 6-step only 2 phases are active)
+  // Let's use a cleaner manual approach:
 
-void step5()
-{
-  allOff();
-  digitalWrite(CH, HIGH);
-  digitalWrite(AL, LOW);
-}
-
-void step6()
-{
-  allOff();
-  digitalWrite(CH, HIGH);
-  digitalWrite(BL, LOW);
-}
-
-void setup()
-{
-
-  pinMode(AL, OUTPUT);
-  digitalWrite(AL, LOW);
-
-  pinMode(AH, OUTPUT);
-  digitalWrite(AH, LOW);
-
-  pinMode(BL, OUTPUT);
-  digitalWrite(BL, LOW);
-
-  pinMode(BH, OUTPUT);
-  digitalWrite(BH, LOW);
-
-  pinMode(CL, OUTPUT);
-  digitalWrite(CL, LOW);
-
-  pinMode(CH, OUTPUT);
-  digitalWrite(CH, LOW);
-
-  pinMode(LED_RED, OUTPUT);
-
-  allOff();
-}
-
-int led_multiplier = 0;
-int led_red_status = 0;
-
-void loop()
-{
-  allOff();
-  int sensorValue = analogRead(A0);
-  int stepDelay = map(sensorValue, 0, 1023, 5000, 1);
-  if (led_multiplier > 1000)
-  {
-    led_multiplier = 0;
-    if (led_red_status == 0)
-    {
-      led_red_status = 1;
-      digitalWrite(LED_RED, 1);
-    }
-    else
-    {
-      led_red_status = 0;
-      digitalWrite(LED_RED, 0);
-    }
-  }
-  led_multiplier++;
-
-  step1();
-  delayMicroseconds(stepDelay);
-  step2();
-  delayMicroseconds(stepDelay);
-  step3();
-  delayMicroseconds(stepDelay);
-  step4();
-  delayMicroseconds(stepDelay);
-  step5();
-  delayMicroseconds(stepDelay);
-  step6();
-  delayMicroseconds(stepDelay);
+  Serial2.println("Step 1"); driver.setPwm(V, 0, 0); delay(step_delay); safetyGap();
+  Serial2.println("Step 2"); driver.setPwm(V, V, 0); delay(step_delay); safetyGap();
+  Serial2.println("Step 3"); driver.setPwm(0, V, 0); delay(step_delay); safetyGap();
+  Serial2.println("Step 4"); driver.setPwm(0, V, V); delay(step_delay); safetyGap();
+  Serial2.println("Step 5"); driver.setPwm(0, 0, V); delay(step_delay); safetyGap();
+  Serial2.println("Step 6"); driver.setPwm(V, 0, V); delay(step_delay); safetyGap();
 }
