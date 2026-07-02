@@ -2,7 +2,7 @@
 #include "pinout.h"
 
 BLDCDriver6PWM driver = BLDCDriver6PWM(DRIVER_UH, DRIVER_UL, DRIVER_VH, DRIVER_VL, DRIVER_WH, DRIVER_WL);
-HardwareSerial Serial2(UART_RX, UART_TX);
+// HardwareSerial Serial2(UART_RX, UART_TX);
 
 void setup() {
   Serial2.begin(115200);
