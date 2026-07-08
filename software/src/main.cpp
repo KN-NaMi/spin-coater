@@ -1,4 +1,5 @@
 #include <SimpleFOC.h>
+#include <IWatchdog.h>
 #include "pinout.h"
 #include "lcd.h"
 #include "scheduler.h"
@@ -10,7 +11,8 @@
 #define MENU_TIMEOUT_MS 1000
 #define POT_MIN 0
 #define POT_MAX 1023
-#define OPTIONAL_THRESHOLD 192
+#define POT_LOW_THRESHOLD 192
+#define WATCHDOG_US 3000000
 
 BLDCMotor motor = BLDCMotor(POLE_PAIRS);
 BLDCDriver6PWM driver = BLDCDriver6PWM(DRIVER_UH, DRIVER_UL, DRIVER_VH, DRIVER_VL, DRIVER_WH, DRIVER_WL);
@@ -26,6 +28,8 @@ job_status input(void);
 
 void enter_menu();
 uint32_t to_2_sig_digits(uint32_t num);
+void die(char const *reason);
+void recover();
 
 typedef uint16_t rpm_t;
 
@@ -58,6 +62,11 @@ void
 setup()
 {
 	struct sched_job *update_timer_job, *smooth_rpm_job, *run_motor_job, *read_hall_job, *update_lcd_job, *heartbeat_led_job, *input_job;
+
+	if(IWatchdog.isReset(true)) {
+		recover();
+	}
+	IWatchdog.begin(WATCHDOG_US);
 
 	init_scheduler();
 
@@ -112,8 +121,8 @@ setup()
 	run_ms = 0;
 	init_lcd(&lcd, 16, 4);
 
-	motor.init();
-	motor.initFOC();
+	if(! motor.init()) die("motor.init()");
+	if(! motor.initFOC()) die("motor.initFOC()");
 }
 
 void
@@ -121,6 +130,7 @@ loop()
 {
 	motor.loopFOC();
 	run_scheduler();
+	IWatchdog.reload();
 }
 
 job_status
@@ -266,9 +276,9 @@ enter_menu()
 		if(editing) {
 			if(! selected.val) break; /* val = NULL means exit button */
 			if(selected.optional) {
-				if(pot_value <= OPTIONAL_THRESHOLD) *selected.val = -1;
+				if(pot_value <= POT_LOW_THRESHOLD) *selected.val = -1;
 				else {
-					*selected.val = map(pot_value, OPTIONAL_THRESHOLD, POT_MAX, selected.min, selected.max);
+					*selected.val = map(pot_value, POT_LOW_THRESHOLD, POT_MAX, selected.min, selected.max);
 					*selected.val = constrain(*selected.val, selected.min, selected.max);
 				}
 			} else {
@@ -305,6 +315,8 @@ enter_menu()
 		}
 
 		flush_lcd(&lcd);
+
+		IWatchdog.reload();
 	}
 
 	motor.enable();
@@ -322,5 +334,59 @@ to_2_sig_digits(uint32_t num)
 	if(num < 100000000) return num - num%1000000;
 	if(num < 1000000000) return num - num%10000000;
 	return num - num%100000000;
+}
+
+void
+die(char const *reason)
+{
+	unsigned int i;
+
+	motor.disable();
+	for(i = 0; i < 4; ++i) {
+		set_cur_lcd(&lcd, 0, i);
+		wipe_line(&lcd);
+	}
+
+	set_cur_lcd(&lcd, 0, 0);
+	printf_lcd(&lcd, "FAILURE");
+	set_cur_lcd(&lcd, 0, 1);
+	printf_lcd(&lcd, "%s", reason);
+	flush_lcd(&lcd);
+
+	for(i = 0; i < 10; ++i) {
+		IWatchdog.reload();
+		delay(1000);
+	}
+
+	for(i = 0; i < 4; ++i) {
+		set_cur_lcd(&lcd, 0, i);
+		wipe_line(&lcd);
+	}
+	set_cur_lcd(&lcd, 0, 0);
+	printf_lcd(&lcd, "Waiting for watchdog reset");
+	flush_lcd(&lcd);
+
+	while(1);
+}
+
+void
+recover()
+{
+	unsigned int i;
+	unsigned int pot_value;
+
+	for(i = 0; i < 4; ++i) {
+		set_cur_lcd(&lcd, 0, i);
+		wipe_line(&lcd);
+	}
+	set_cur_lcd(&lcd, 0, 0);
+	printf_lcd(&lcd, "RECOVERING");
+	set_cur_lcd(&lcd, 0, 1);
+	printf_lcd(&lcd, "Set pot to min");
+	flush_lcd(&lcd);
+
+	do {
+		pot_value = analogRead(POT_PIN);
+	} while(pot_value < POT_LOW_THRESHOLD);
 }
 
