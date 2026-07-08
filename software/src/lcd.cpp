@@ -32,7 +32,7 @@ init_lcd(struct lcd *lcd, unsigned int width, unsigned int height)
 }
 
 void
-printf_lcd(struct lcd *lcd, char *fmt, ...)
+printf_lcd(struct lcd *lcd, char const *fmt, ...)
 {
 	va_list args, arg_cpy;
 	unsigned int pos, remaining;

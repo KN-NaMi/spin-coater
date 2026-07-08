@@ -17,7 +17,7 @@ struct lcd {
 };
 
 int init_lcd(struct lcd *lcd, unsigned int width, unsigned int height);
-void printf_lcd(struct lcd *lcd, char *fmt, ...);
+void printf_lcd(struct lcd *lcd, char const *fmt, ...);
 void wipe_line(struct lcd *lcd);
 void set_cur_lcd(struct lcd *lcd, unsigned int x, unsigned int y);
 void flush_lcd(struct lcd *lcd);
