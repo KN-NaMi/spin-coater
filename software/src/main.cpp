@@ -34,6 +34,7 @@ rpm_t set_rpm;
 rpm_t target_rpm;
 rpm_t current_rpm;
 int running;
+uint32_t run_ms;
 struct lcd lcd(0x27, 16, 4);
 
 void doA(){ sensor.handleA(); }
@@ -99,7 +100,7 @@ setup()
 	heartbeat_led_job->interval_us = 500000;
 	heartbeat_led_job->flags = SCHED_RUNNING;
 	input_job = sched_register(input);
-	input_job->interval_us = 250000;
+	input_job->interval_us = 100000;
 	input_job->flags = SCHED_RUNNING | SCHED_MAY_STALL;
 
 	pinMode(BUTTON_PIN, INPUT_PULLDOWN);
@@ -108,6 +109,7 @@ setup()
 	pinMode(LED_RED, OUTPUT);
 	running = 0;
 	timer = -1;
+	run_ms = 0;
 	init_lcd(&lcd, 16, 4);
 
 	motor.init();
@@ -124,7 +126,6 @@ loop()
 job_status
 update_timer(void)
 {
-	static uint32_t run_ms = 0;
 	uint32_t now;
 
 	now = millis();
