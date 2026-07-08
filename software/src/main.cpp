@@ -191,7 +191,11 @@ update_lcd(void)
 	wipe_line(&lcd);
 	set_cur_lcd(&lcd, 0, 3);
 	if(timer != -1) {
-		printf_lcd(&lcd, "TMR: %d s", (int)timer);
+		if(running) {
+			printf_lcd(&lcd, "TMR: %d s", (int)(run_ms - millis())/1000 + timer);
+		} else {
+			printf_lcd(&lcd, "TMR: %d s", (int)timer);
+		}
 	} else {
 		printf_lcd(&lcd, "MANUAL");
 	}
@@ -255,6 +259,7 @@ enter_menu()
 
 	editing = 0;
 	pressed = 0;
+	last_lcd_update_ms = 0;
 	while(1) {
 		pot_value = analogRead(POT_PIN);
 		if(editing) {
