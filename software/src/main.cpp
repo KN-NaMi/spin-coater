@@ -1,18 +1,17 @@
 #include <SimpleFOC.h>
 #include <IWatchdog.h>
 #include "pinout.h"
-#include "lcd.h"
+//#include "lcd.h"
 #include "scheduler.h"
 
 #define POLE_PAIRS 4 /* number of poles = 8, then pole pair count = 4 ??? */
-#define RPM_SMOOTHING 16 /* this number times 20 is the total change in RPM per second */
-#define MOTOR_MIN_RPM 100
-#define MOTOR_MAX_RPM 4000
+#define MOTOR_MIN_RPM 256
+#define MOTOR_MAX_RPM 2000
 #define MENU_TIMEOUT_MS 1000
 #define POT_MIN 0
 #define POT_MAX 1023
 #define POT_LOW_THRESHOLD 192
-#define WATCHDOG_US 3000000
+#define WATCHDOG_US 10000000
 
 BLDCMotor motor = BLDCMotor(POLE_PAIRS);
 BLDCDriver6PWM driver = BLDCDriver6PWM(DRIVER_UH, DRIVER_UL, DRIVER_VH, DRIVER_VL, DRIVER_WH, DRIVER_WL);
@@ -30,32 +29,45 @@ void enter_menu();
 uint32_t to_2_sig_digits(uint32_t num);
 void die(char const *reason);
 void recover();
+float mapf(float v, float bmin, float bmax, float amin, float amax);
 
-typedef uint16_t rpm_t;
+typedef int rpm_t;
 
 int timer;
 rpm_t set_rpm;
 rpm_t target_rpm;
 rpm_t current_rpm;
+rpm_t accel;
 int running;
 uint32_t run_ms;
-struct lcd lcd(0x27, 16, 4);
+//struct lcd lcd(0x27, 16, 4);
 
 void doA(){ sensor.handleA(); }
 void doB(){ sensor.handleB(); }
 void doC(){ sensor.handleC(); }
 
+enum option_type { OPTION_INT, OPTION_FLOAT, OPTION_EXIT };
 struct option {
 	char const *text;
 	char const *sel;
 	char const *fmt;
-	int *val;
-	int min, max;
+	enum option_type type;
+	union {
+		struct {
+			int *val;
+			int min, max;
+		} i;
+		struct {
+			float *val;
+			float min, max;
+		} f;
+	};
 	int optional;
 };
 struct option options[] = {
-	{ .text = "timer", .sel = "TIMER", .fmt = "%d s",   .val = &timer, .min = 1, .max = 120, .optional = 1 },
-	{ .text = "exit",  .sel = "exit",  .fmt = "(exit)", .val = NULL,   .min = 0, .max = 0,   .optional = 0 },
+	{ .text = "timer", .sel = "TIMER", .fmt = "%d s",     .type=OPTION_INT,  .i={&timer, 1, 120}, .optional = 1 },
+	{ .text = "ramp",  .sel = "RAMP",  .fmt = "%d*20rad/s", .type=OPTION_INT,  .i={&accel, 1, 32},  .optional = 0 },
+	{ .text = "exit",  .sel = "exit",  .fmt = "(exit)",   .type=OPTION_EXIT,                      .optional = 0 },
 };
 
 void
@@ -63,21 +75,28 @@ setup()
 {
 	struct sched_job *update_timer_job, *smooth_rpm_job, *run_motor_job, *read_hall_job, *update_lcd_job, *heartbeat_led_job, *input_job;
 
+	Serial2.begin(115200);
+	Serial2.println("setup");
+
 	if(IWatchdog.isReset(true)) {
 		recover();
 	}
-	IWatchdog.begin(WATCHDOG_US);
+	Serial2.println("starting watchdog");
+	//IWatchdog.begin(WATCHDOG_US);
 
+	Serial2.println("initializing sched");
 	init_scheduler();
 
+	Serial2.println("initializing sensor");
 	sensor.init();
 	sensor.enableInterrupts(doA, doB, doC);
 	motor.linkSensor(&sensor);
 
+	Serial2.println("initializing driver");
 	driver.voltage_power_supply = 12;
 	driver.pwm_frequency = 4000;
 	driver.dead_zone = 0.05;
-	driver.init();
+	if(!driver.init()) die("driver init");
 	motor.linkDriver(&driver);
 
 	// Invert logic for PMOS -> Driver specific
@@ -85,11 +104,18 @@ setup()
 	TIM1->CCER &= ~(TIM_CCER_CC1NP | TIM_CCER_CC2NP | TIM_CCER_CC3NP);
 
 	motor.controller = MotionControlType::velocity;
-	motor.PID_velocity.P = 0.002;
-	motor.PID_velocity.I = 0.01;
-	motor.PID_velocity.D = 0.0005;
-	motor.voltage_limit = 6;
+	motor.PID_velocity.P = 0.01;
+	motor.PID_velocity.I = 0.1;
+	motor.PID_velocity.D = 0;
+	motor.voltage_limit = 12;
 
+	Serial2.println("initing motor");
+	if(! motor.init()) die("motor.init()");
+	Serial2.println("initFOC");
+	SimpleFOCDebug::enable(&Serial2);
+	if(! motor.initFOC()) die("motor.initFOC()");
+
+	Serial2.println("adding jobs");
 	update_timer_job = sched_register(update_timer);
 	update_timer_job->interval_us = 1000000;
 	update_timer_job->flags = SCHED_RUNNING | SCHED_PRIORITY;
@@ -112,6 +138,7 @@ setup()
 	input_job->interval_us = 100000;
 	input_job->flags = SCHED_RUNNING | SCHED_MAY_STALL;
 
+	Serial2.println("setting up IO");
 	pinMode(BUTTON_PIN, INPUT_PULLDOWN);
 	pinMode(POT_PIN, INPUT);
 	pinMode(LED_YELLOW, OUTPUT);
@@ -119,10 +146,12 @@ setup()
 	running = 0;
 	timer = -1;
 	run_ms = 0;
-	init_lcd(&lcd, 16, 4);
+	accel = 16;
+	Serial2.println("setting up lcd");
+	//Wire.begin(I2C_SDA, I2C_SCL);
+	//init_lcd(&lcd, 16, 4);
 
-	if(! motor.init()) die("motor.init()");
-	if(! motor.initFOC()) die("motor.initFOC()");
+	Serial2.println("initialized");
 }
 
 void
@@ -155,9 +184,11 @@ smooth_rpm(void)
 	unsigned int pot_value;
 
 	pot_value = analogRead(POT_PIN);
-	set_rpm = running ? map(pot_value, POT_MIN, POT_MAX, MOTOR_MIN_RPM, MOTOR_MAX_RPM) : 0;
-	if(set_rpm > target_rpm + RPM_SMOOTHING) target_rpm += RPM_SMOOTHING;
-	else if(set_rpm + RPM_SMOOTHING < target_rpm) target_rpm -= RPM_SMOOTHING;
+	set_rpm = map(pot_value, POT_MIN, POT_MAX, MOTOR_MIN_RPM, MOTOR_MAX_RPM);
+	if(!running) set_rpm = 0;
+
+	if(target_rpm + accel < set_rpm) target_rpm += accel;
+	else if(target_rpm > set_rpm + accel) target_rpm -= accel;
 	else target_rpm = set_rpm;
 
 	return JOB_OK;
@@ -191,27 +222,43 @@ read_hall(void)
 job_status
 update_lcd(void)
 {
-	set_cur_lcd(&lcd, 0, 0);
-	printf_lcd(&lcd, "SET: %d", (int)to_2_sig_digits(set_rpm));
-	wipe_line(&lcd);
-	set_cur_lcd(&lcd, 0, 1);
-	printf_lcd(&lcd, "TGT: %d", (int)to_2_sig_digits(target_rpm));
-	wipe_line(&lcd);
-	set_cur_lcd(&lcd, 0, 2);
-	printf_lcd(&lcd, "CUR: %d", (int)to_2_sig_digits(current_rpm));
-	wipe_line(&lcd);
-	set_cur_lcd(&lcd, 0, 3);
+	Serial2.print("SET: "); Serial2.println(to_2_sig_digits(set_rpm));
+	Serial2.print("TGT: "); Serial2.println(to_2_sig_digits(target_rpm));
+	Serial2.print("CUR: "); Serial2.println(to_2_sig_digits(current_rpm));
 	if(timer != -1) {
 		if(running) {
-			printf_lcd(&lcd, "TMR: %d s", (int)(run_ms - millis())/1000 + timer);
+			Serial2.print("TMR: "); Serial2.print((run_ms + timer*1000 - millis())/1000); Serial2.println(" s");
 		} else {
-			printf_lcd(&lcd, "TMR: %d s", (int)timer);
+			Serial2.print("TMR: "); Serial2.print(timer); Serial2.println(" s");
 		}
 	} else {
-		printf_lcd(&lcd, "MANUAL");
+		Serial2.println("MANUAL");
 	}
-	wipe_line(&lcd);
-	flush_lcd(&lcd);
+	/* TODO */
+
+
+
+	//set_cur_lcd(&lcd, 0, 0);
+	//printf_lcd(&lcd, "SET: %d", (int)to_2_sig_digits(set_rpm));
+	//wipe_line(&lcd);
+	//set_cur_lcd(&lcd, 0, 1);
+	//printf_lcd(&lcd, "TGT: %d", (int)to_2_sig_digits(target_rpm));
+	//wipe_line(&lcd);
+	//set_cur_lcd(&lcd, 0, 2);
+	//printf_lcd(&lcd, "CUR: %d", (int)to_2_sig_digits(current_rpm));
+	//wipe_line(&lcd);
+	//set_cur_lcd(&lcd, 0, 3);
+	//if(timer != -1) {
+	//	if(running) {
+	//		printf_lcd(&lcd, "TMR: %d s", (int)(run_ms - millis())/1000 + timer);
+	//	} else {
+	//		printf_lcd(&lcd, "TMR: %d s", (int)timer);
+	//	}
+	//} else {
+	//	printf_lcd(&lcd, "MANUAL");
+	//}
+	//wipe_line(&lcd);
+	//flush_lcd(&lcd);
 
 	return JOB_OK;
 }
@@ -243,6 +290,7 @@ input(void)
 	} else {
 		if(press_ms != (uint32_t)-1) {
 			if(millis() - press_ms >= MENU_TIMEOUT_MS) {
+				press_ms = (uint32_t)-1;
 				enter_menu();
 				return JOB_STALLED;
 			} else {
@@ -262,7 +310,7 @@ enter_menu()
 	unsigned int pot_value;
 	uint8_t opt;
 	struct option selected;
-	int editing, pressed;
+	int editing, pressed, menu_running;
 	uint32_t last_lcd_update_ms;
 
 	running = 0;
@@ -270,23 +318,33 @@ enter_menu()
 
 	editing = 0;
 	pressed = 0;
+	menu_running = 1;
 	last_lcd_update_ms = 0;
-	while(1) {
+	while(menu_running) {
 		pot_value = analogRead(POT_PIN);
 		if(editing) {
-			if(! selected.val) break; /* val = NULL means exit button */
-			if(selected.optional) {
-				if(pot_value <= POT_LOW_THRESHOLD) *selected.val = -1;
-				else {
-					*selected.val = map(pot_value, POT_LOW_THRESHOLD, POT_MAX, selected.min, selected.max);
-					*selected.val = constrain(*selected.val, selected.min, selected.max);
+			pot_value = constrain(pot_value, POT_MIN, POT_MAX);
+			switch(selected.type) {
+			case OPTION_INT:
+				if(selected.optional) {
+					*selected.i.val = (pot_value<POT_LOW_THRESHOLD) ? -1 : map(pot_value, POT_LOW_THRESHOLD, POT_MAX, selected.i.min, selected.i.max);
+				} else {
+					*selected.i.val = map(pot_value, POT_MIN, POT_MAX, selected.i.min, selected.i.max);
 				}
-			} else {
-				*selected.val = map(pot_value, POT_MIN, POT_MAX, selected.min, selected.max);
-				*selected.val = constrain(*selected.val, selected.min, selected.max);
+				break;
+			case OPTION_FLOAT:
+				if(selected.optional) {
+					*selected.f.val = (pot_value<POT_LOW_THRESHOLD) ? -1.0f : mapf(pot_value, POT_LOW_THRESHOLD, POT_MAX, selected.f.min, selected.f.max);
+				} else {
+					*selected.f.val = mapf(pot_value, POT_MIN, POT_MAX, selected.f.min, selected.f.max);
+				}
+				break;
+			case OPTION_EXIT:
+				menu_running = 0;
+				break;
 			}
 		} else {
-			opt = map(pot_value, POT_MIN, POT_MAX, 0, sizeof(options)/sizeof(*options) - 1);
+			opt = map(pot_value, POT_MIN, POT_MAX, 0, sizeof(options)/sizeof(*options));
 			opt = constrain(opt, 0, (sizeof(options)/sizeof(*options)) - 1);
 			selected = options[opt];
 		}
@@ -299,22 +357,40 @@ enter_menu()
 		}
 
 		if(millis() - last_lcd_update_ms >= 1000) {
-			set_cur_lcd(&lcd, 0, 0);
-			printf_lcd(&lcd, "Options");
-			wipe_line(&lcd);
-			set_cur_lcd(&lcd, 0, 1);
-			printf_lcd(&lcd, "%s", editing ? selected.sel : selected.text);
-			wipe_line(&lcd);
-			set_cur_lcd(&lcd, 0, 2);
-			printf_lcd(&lcd, selected.fmt, selected.val ? *selected.val : 0);
-			wipe_line(&lcd);
-			set_cur_lcd(&lcd, 0, 3);
-			printf_lcd(&lcd, "%d/%d", opt + 1, sizeof(options)/sizeof(*options));
-			wipe_line(&lcd);
+			Serial2.println("Options");
+			Serial2.println(editing ? selected.sel : selected.text);
+			char buf[256];
+			switch(selected.type) {
+			case OPTION_INT:
+				snprintf(buf, sizeof(buf), selected.fmt, selected.i.val ? *selected.i.val : 0);
+				break;
+			case OPTION_FLOAT:
+				snprintf(buf, sizeof(buf), selected.fmt, selected.f.val ? *selected.f.val : 0.0f);
+				break;
+			case OPTION_EXIT:
+				strncpy(buf, "(exit)", sizeof(buf));
+				break;
+			}
+			Serial2.println(buf);
+			Serial2.print(opt + 1); Serial2.print(" / "); Serial2.println(sizeof(options)/sizeof(*options));
 			last_lcd_update_ms += 1000;
+
+			//set_cur_lcd(&lcd, 0, 0);
+			//printf_lcd(&lcd, "Options");
+			//wipe_line(&lcd);
+			//set_cur_lcd(&lcd, 0, 1);
+			//printf_lcd(&lcd, "%s", editing ? selected.sel : selected.text);
+			//wipe_line(&lcd);
+			//set_cur_lcd(&lcd, 0, 2);
+			//printf_lcd(&lcd, selected.fmt, selected.val ? *selected.val : 0);
+			//wipe_line(&lcd);
+			//set_cur_lcd(&lcd, 0, 3);
+			//printf_lcd(&lcd, "%d/%d", opt + 1, sizeof(options)/sizeof(*options));
+			//wipe_line(&lcd);
+			//last_lcd_update_ms += 1000;
 		}
 
-		flush_lcd(&lcd);
+		//flush_lcd(&lcd);
 
 		IWatchdog.reload();
 	}
@@ -341,32 +417,44 @@ die(char const *reason)
 {
 	unsigned int i;
 
+	Serial2.println("dying");
+
 	motor.disable();
+	Serial2.println("disabled");
 	for(i = 0; i < 4; ++i) {
-		set_cur_lcd(&lcd, 0, i);
-		wipe_line(&lcd);
+		//set_cur_lcd(&lcd, 0, i);
+		//wipe_line(&lcd);
 	}
 
-	set_cur_lcd(&lcd, 0, 0);
-	printf_lcd(&lcd, "FAILURE");
-	set_cur_lcd(&lcd, 0, 1);
-	printf_lcd(&lcd, "%s", reason);
-	flush_lcd(&lcd);
+	Serial2.println(reason);
+
+	//set_cur_lcd(&lcd, 0, 0);
+	//printf_lcd(&lcd, "FAILURE");
+	//set_cur_lcd(&lcd, 0, 1);
+	//printf_lcd(&lcd, "%s", reason);
+	//flush_lcd(&lcd);
 
 	for(i = 0; i < 10; ++i) {
 		IWatchdog.reload();
+		Serial2.println("dead");
 		delay(1000);
 	}
 
 	for(i = 0; i < 4; ++i) {
-		set_cur_lcd(&lcd, 0, i);
-		wipe_line(&lcd);
+		//set_cur_lcd(&lcd, 0, i);
+		//wipe_line(&lcd);
 	}
-	set_cur_lcd(&lcd, 0, 0);
-	printf_lcd(&lcd, "Waiting for watchdog reset");
-	flush_lcd(&lcd);
+	//set_cur_lcd(&lcd, 0, 0);
+	//printf_lcd(&lcd, "Waiting for watchdog reset");
+	//wipe_line(&lcd);
+	//flush_lcd(&lcd);
 
-	while(1);
+	for(i = 0; 1; ++i) {
+		//set_cur_lcd(&lcd, 0, 2);
+		//printf_lcd(&lcd, "i: %u", i);
+		//wipe_line(&lcd);
+		//flush_lcd(&lcd);
+	};
 }
 
 void
@@ -376,17 +464,23 @@ recover()
 	unsigned int pot_value;
 
 	for(i = 0; i < 4; ++i) {
-		set_cur_lcd(&lcd, 0, i);
-		wipe_line(&lcd);
+		//set_cur_lcd(&lcd, 0, i);
+		//wipe_line(&lcd);
 	}
-	set_cur_lcd(&lcd, 0, 0);
-	printf_lcd(&lcd, "RECOVERING");
-	set_cur_lcd(&lcd, 0, 1);
-	printf_lcd(&lcd, "Set pot to min");
-	flush_lcd(&lcd);
+	//set_cur_lcd(&lcd, 0, 0);
+	//printf_lcd(&lcd, "RECOVERING");
+	//set_cur_lcd(&lcd, 0, 1);
+	//printf_lcd(&lcd, "Set pot to min");
+	//flush_lcd(&lcd);
 
 	do {
 		pot_value = analogRead(POT_PIN);
 	} while(pot_value < POT_LOW_THRESHOLD);
+}
+
+float
+mapf(float v, float bmin, float bmax, float amin, float amax)
+{
+	return (v - bmin) * (amax-amin) / (bmax-bmin) + amin;
 }
 

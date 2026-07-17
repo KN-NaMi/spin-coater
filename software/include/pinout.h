@@ -22,8 +22,8 @@
 #define BUTTON_PIN PA1 // The button needs pull-down to work
 #define POT_PIN PA0
 // I2C is I2C1
-#define I2C_SCL PB8 // I haven't tested I2C but it should work. If not, try adding internal pull-up's for both pins or swapping them
-#define I2C_SDA PB9
+#define I2C_SCL PB6 // I haven't tested I2C but it should work. If not, try adding internal pull-up's for both pins or swapping them
+#define I2C_SDA PB7
 
 // --- Status LEDs ---
 #define LED_YELLOW PC13
