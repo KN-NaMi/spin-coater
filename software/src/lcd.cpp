@@ -15,24 +15,30 @@ init_lcd(struct lcd *lcd, unsigned int width, unsigned int height)
 	lcd->height = height;
 	lcd->cur_x = lcd->cur_y = 0;
 
+	Serial2.println("test");
 	if((lcd->cur_scr = (char *)malloc(width * height)) == NULL) {
 		return -1;
 	}
+	Serial2.println("test2");
 	memset(lcd->cur_scr, ' ', width * height);
 	if((lcd->prev_scr = (char *)malloc(width * height)) == NULL) {
 		free(lcd->cur_scr);
 		return -1;
 	}
+	Serial2.println("test3");
 	memset(lcd->prev_scr, ' ', width * height);
 
+	Serial2.println("test4");
 	lcd->lcdc.init();
+	Serial2.println("test5");
 	lcd->lcdc.backlight();
+	Serial2.println("test6");
 
 	return 0;
 }
 
 void
-printf_lcd(struct lcd *lcd, char *fmt, ...)
+printf_lcd(struct lcd *lcd, char const *fmt, ...)
 {
 	va_list args, arg_cpy;
 	unsigned int pos, remaining;
